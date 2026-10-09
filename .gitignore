@@ -1,0 +1,22 @@
+# 构建产物
+target/
+
+# 数据库备份 / 日志
+backups/
+backup/
+db/
+*.log
+backup-err.log
+
+# 大文件备份（AI 模型历史版本、Blender 备份）
+assets/models-ai-backup/
+*.bak-*
+
+# 工作台内部数据
+.workbuddy/
+
+# IDE / 系统
+.idea/
+*.iml
+.vscode/
+Thumbs.db

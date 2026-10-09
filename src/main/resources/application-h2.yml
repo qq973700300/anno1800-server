@@ -1,0 +1,16 @@
+# 单机调试 profile：java -jar target/anno1800-server.jar --spring.profiles.active=h2 --server.port=8080
+spring:
+  config:
+    activate:
+      on-profile: h2
+  datasource:
+    # MODE=MySQL：本项目部分原子 SQL 用了 MySQL 方言（insert ignore / on duplicate key update），
+    # H2 必须开 MySQL 兼容模式才能解析，否则注册建库存行就会报语法错误。
+    url: jdbc:h2:mem:anno1800;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  h2:
+    console:
+      enabled: true
+      path: /h2-console

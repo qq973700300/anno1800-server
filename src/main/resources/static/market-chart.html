@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>纪元1800 · 商品价格行情图</title>
+<style>
+  :root{
+    --bg:#0d1520; --panel:#131c29; --line:#22304a; --txt:#e6edf6; --dim:#7d90ab;
+    --up:#ef4b4b; --down:#2fbf71; --ma5:#f2c14e; --ma10:#4c8dff; --cross:#8fa3bd;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.5 "Microsoft YaHei",system-ui,sans-serif}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 16px;
+    background:linear-gradient(90deg,#131c29,#1b2637);border-bottom:1px solid var(--line)}
+  header h1{margin:0;font-size:16px;color:var(--gold,#f2c14e)}
+  select,button{background:#1b2637;color:var(--txt);border:1px solid var(--line);border-radius:6px;
+    padding:5px 10px;font-size:13px;font-family:inherit;cursor:pointer}
+  button:hover{background:#24344d}
+  button.on{background:#2f6b45;border-color:#3d8a59}
+  .quote{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin-left:auto;font-size:13px}
+  .quote .price{font-size:26px;font-weight:700;letter-spacing:.5px}
+  .quote .chg{font-size:15px;font-weight:600}
+  .up{color:var(--up)} .down{color:var(--down)} .dim{color:var(--dim)}
+  .meta{display:flex;gap:16px;padding:6px 16px;font-size:12px;color:var(--dim);
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
+  #wrap{position:relative;padding:10px 16px}
+  canvas{width:100%;height:520px;display:block;cursor:crosshair}
+  #tip{position:absolute;pointer-events:none;background:#0b1220ee;border:1px solid var(--line);
+    border-radius:6px;padding:7px 10px;font-size:12px;white-space:nowrap;display:none;z-index:9}
+  footer{padding:8px 16px;color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 纪元1800 · 商品行情</h1>
+  <select id="goodSel"></select>
+  <button id="btnTick" class="on">分时</button>
+  <button id="btn1m">1分</button>
+  <button id="btn5m">5分</button>
+  <button id="btn15m">15分</button>
+  <span class="dim" id="refreshTip">每 5 秒自动刷新</span>
+  <div class="quote">
+    <span class="price" id="price">--</span>
+    <span class="chg" id="chg">--</span>
+    <span class="dim" id="base">基准价 --</span>
+  </div>
+</header>
+
+<div class="meta">
+  <span>最高 <b id="hi">--</b></span>
+  <span>最低 <b id="lo">--</b></span>
+  <span>区间涨跌 <b id="rng">--</b></span>
+  <span>累计成交 <b id="vol">--</b></span>
+  <span>样本 <b id="cnt">--</b></span>
+  <span class="dim">红涨绿跌 · MA5 <span style="color:var(--ma5)">—</span> MA10 <span style="color:var(--ma10)">—</span></span>
+</div>
+
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="tip"></div>
+</div>
+
+<footer>数据源：<code>GET /api/market/kline</code>（蜡烛）与 <code>GET /api/market/history</code>（分时），后端每 5 秒采样一次。</footer>
+
+<script>
+// 后端地址：默认本机 8080，也可用 ?api=http://192.168.1.9:8080 指定
+const API = new URLSearchParams(location.search).get("api") || "http://localhost:8080";
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d"), tip = document.getElementById("tip");
+let mode = "tick";               // tick | 60 | 300 | 900
+let candles = [], points = [], good = "WOOD", hover = -1, basePrice = 0;
+
+const fmt = (v, d = 2) => Number(v).toFixed(d);
+const hhmm = ts => { const d = new Date(ts); return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); };
+
+/* ---------------- 数据 ---------------- */
+async function loadGoods(){
+  const goods = await (await fetch(API+"/api/world/goods")).json();
+  const sel = document.getElementById("goodSel");
+  sel.innerHTML = goods.data.map(g=>`<option value="${g.code}" ${g.code===good?"selected":""}>${g.label}</option>`).join("");
+  basePrice = goods.data.find(g=>g.code===good).basePrice;
+}
+async function load(){
+  if(mode === "tick"){
+    const r = await (await fetch(`${API}/api/market/history?good=${good}&seconds=3600`)).json();
+    points = r.data || [];
+    candles = [];
+  } else {
+    const r = await (await fetch(`${API}/api/market/kline?good=${good}&period=${mode}&limit=180`)).json();
+    candles = r.data || [];
+    points = candles.map(c=>({ts:c.ts, price:c.close, volume:c.volume}));
+  }
+  render();
+}
+
+/* ---------------- 报价栏 ---------------- */
+function renderQuote(){
+  const last = points.length ? points[points.length-1].price : 0;
+  const first = points.length ? points[0].price : 0;
+  const highs = mode==="tick" ? points.map(p=>p.price) : candles.map(c=>c.high);
+  const lows  = mode==="tick" ? points.map(p=>p.price) : candles.map(c=>c.low);
+  const hi = highs.length?Math.max(...highs):0, lo = lows.length?Math.min(...lows):0;
+  const rangeChg = first ? (last-first)/first*100 : 0;
+  const baseChg  = basePrice ? (last-basePrice)/basePrice*100 : 0;
+  const vol = points.reduce((s,p)=>s+(p.volume||0),0);
+
+  const pEl = document.getElementById("price");
+  pEl.textContent = "¥"+fmt(last);
+  pEl.className = "price " + (baseChg>=0?"up":"down");
+  const cEl = document.getElementById("chg");
+  cEl.textContent = `${baseChg>=0?"+":""}${fmt(baseChg)}%（对基准价）`;
+  cEl.className = "chg " + (baseChg>=0?"up":"down");
+  document.getElementById("base").textContent = "基准价 ¥"+fmt(basePrice);
+  document.getElementById("hi").textContent = "¥"+fmt(hi);
+  document.getElementById("lo").textContent = "¥"+fmt(lo);
+  const rEl = document.getElementById("rng");
+  rEl.textContent = `${rangeChg>=0?"+":""}${fmt(rangeChg)}%`;
+  rEl.className = rangeChg>=0?"up":"down";
+  document.getElementById("vol").textContent = vol;
+  document.getElementById("cnt").textContent = (mode==="tick"?points.length:candles.length)+" 个";
+}
+
+/* ---------------- 绘图 ---------------- */
+function render(){
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W*dpr; cv.height = H*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  renderQuote();
+
+  const padL = 10, padR = 66, padT = 12, padB = 26;
+  const mainH = (H-padT-padB)*0.72, volH = (H-padT-padB)*0.28 - 14;
+  const plotW = W-padL-padR;
+  const n = points.length;
+
+  if(n < 1){
+    ctx.fillStyle = "#7d90ab"; ctx.font = "14px Microsoft YaHei"; ctx.textAlign="center";
+    ctx.fillText("正在采集行情…（后端每 5 秒采样一次，稍等几秒）", W/2, H/2);
+    return;
+  }
+
+  // 价格范围
+  let hi, lo;
+  if(mode === "tick"){
+    hi = Math.max(...points.map(p=>p.price)); lo = Math.min(...points.map(p=>p.price));
+  } else {
+    hi = Math.max(...candles.map(c=>c.high)); lo = Math.min(...candles.map(c=>c.low));
+  }
+  const ma5 = ma(5), ma10 = ma(10);
+  const allv = [...(ma5.filter(v=>v!=null)), ...(ma10.filter(v=>v!=null))];
+  if(allv.length){ hi = Math.max(hi, ...allv); lo = Math.min(lo, ...allv); }
+  const span = (hi-lo) || Math.max(hi*0.02, 0.5);
+  hi += span*0.08; lo -= span*0.08;
+
+  const maxVol = Math.max(1, ...points.map(p=>p.volume||0));
+  const yOf = v => padT + (hi-v)/(hi-lo)*mainH;
+  const xOf = i => padL + (n===1 ? plotW/2 : i/(n-1)*plotW);
+  const candleW = Math.max(2, Math.min(16, plotW/n*0.66));
+
+  /* 网格 + 价格刻度 */
+  ctx.strokeStyle = "#1b2637"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#7d90ab"; ctx.font = "11px Consolas,monospace"; ctx.textAlign = "left";
+  for(let i=0;i<=4;i++){
+    const v = lo + (hi-lo)*i/4, y = yOf(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL+plotW, y); ctx.stroke();
+    ctx.fillStyle = "#7d90ab";
+    ctx.fillText(fmt(v), padL+plotW+8, y+4);
+  }
+  /* 成交量基线 */
+  const volBase = padT+mainH+14+volH;
+  ctx.strokeStyle="#1b2637";
+  ctx.beginPath(); ctx.moveTo(padL, volBase); ctx.lineTo(padL+plotW, volBase); ctx.stroke();
+
+  /* 时间刻度 */
+  ctx.textAlign = "center"; ctx.fillStyle = "#7d90ab";
+  const step = Math.max(1, Math.floor(n/6));
+  for(let i=0;i<n;i+=step){
+    ctx.fillText(hhmm(points[i].ts), xOf(i), H-8);
+  }
+
+  if(mode === "tick"){
+    /* 分时：面积 + 折线 */
+    const grad = ctx.createLinearGradient(0, padT, 0, padT+mainH);
+    grad.addColorStop(0, "rgba(76,141,255,.28)");
+    grad.addColorStop(1, "rgba(76,141,255,0)");
+    ctx.beginPath();
+    points.forEach((p,i)=> i?ctx.lineTo(xOf(i), yOf(p.price)):ctx.moveTo(xOf(i), yOf(p.price)));
+    ctx.lineTo(xOf(n-1), padT+mainH); ctx.lineTo(xOf(0), padT+mainH); ctx.closePath();
+    ctx.fillStyle = grad; ctx.fill();
+
+    ctx.beginPath();
+    points.forEach((p,i)=> i?ctx.lineTo(xOf(i), yOf(p.price)):ctx.moveTo(xOf(i), yOf(p.price)));
+    ctx.strokeStyle = "#4c8dff"; ctx.lineWidth = 1.6; ctx.stroke();
+
+    /* 基准价虚线 */
+    if(basePrice>lo && basePrice<hi){
+      ctx.setLineDash([4,4]); ctx.strokeStyle="#5a6b85";
+      ctx.beginPath(); ctx.moveTo(padL, yOf(basePrice)); ctx.lineTo(padL+plotW, yOf(basePrice)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  } else {
+    /* 蜡烛图 */
+    candles.forEach((c,i)=>{
+      const up = c.close >= c.open;
+      const col = up ? "#ef4b4b" : "#2fbf71";
+      const x = xOf(i);
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, yOf(c.high)); ctx.lineTo(x, yOf(c.low)); ctx.stroke();
+      const yo = yOf(c.open), yc = yOf(c.close);
+      const top = Math.min(yo,yc), h = Math.max(1, Math.abs(yc-yo));
+      ctx.fillStyle = col;
+      ctx.fillRect(x-candleW/2, top, candleW, h);
+    });
+    /* 均线 */
+    drawMA(ma5, "#f2c14e", xOf, yOf, n);
+    drawMA(ma10, "#4c8dff", xOf, yOf, n);
+  }
+
+  /* 成交量柱 */
+  points.forEach((p,i)=>{
+    const h = (p.volume||0)/maxVol*volH;
+    const up = i===0 ? true : (points[i].price >= points[i-1].price);
+    ctx.fillStyle = up ? "rgba(239,75,75,.75)" : "rgba(47,191,113,.75)";
+    ctx.fillRect(xOf(i)-candleW/2, volBase-h, Math.max(1,candleW), h);
+  });
+
+  /* 十字光标 */
+  if(hover >= 0 && hover < n){
+    const x = xOf(hover), p = points[hover];
+    ctx.setLineDash([3,3]); ctx.strokeStyle = "#8fa3bd"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, volBase); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padL, yOf(p.price)); ctx.lineTo(padL+plotW, yOf(p.price)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#0b1220"; ctx.fillRect(padL+plotW+2, yOf(p.price)-9, padR-6, 18);
+    ctx.fillStyle = "#e6edf6"; ctx.textAlign = "left"; ctx.font="11px Consolas,monospace";
+    ctx.fillText(fmt(p.price), padL+plotW+8, yOf(p.price)+4);
+
+    let html = `<b>${hhmm(p.ts)}</b><br>价格 ¥${fmt(p.price)}`;
+    if(mode!=="tick"){
+      const c = candles[hover];
+      html += `<br>开 ¥${fmt(c.open)} 高 ¥${fmt(c.high)}<br>低 ¥${fmt(c.low)} 收 ¥${fmt(c.close)}
+               <br>涨跌 ${((c.close-c.open)/c.open*100).toFixed(2)}%`;
+    }
+    html += `<br>成交 ${p.volume||0}`;
+    tip.innerHTML = html;
+    tip.style.display = "block";
+    const wrapW = document.getElementById("wrap").clientWidth;
+    tip.style.left = Math.min(x+14, wrapW-150) + "px";
+    tip.style.top = "20px";
+  } else {
+    tip.style.display = "none";
+  }
+}
+
+function drawMA(arr, color, xOf, yOf, n){
+  ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.beginPath();
+  let started = false;
+  arr.forEach((v,i)=>{
+    if(v==null) return;
+    if(!started){ ctx.moveTo(xOf(i), yOf(v)); started = true; }
+    else ctx.lineTo(xOf(i), yOf(v));
+  });
+  ctx.stroke();
+}
+function ma(period){
+  const out = [];
+  for(let i=0;i<points.length;i++){
+    if(i < period-1){ out.push(null); continue; }
+    let s = 0;
+    for(let k=0;k<period;k++) s += points[i-k].price;
+    out.push(s/period);
+  }
+  return out;
+}
+
+/* ---------------- 交互 ---------------- */
+cv.addEventListener("mousemove", e=>{
+  const r = cv.getBoundingClientRect();
+  const x = e.clientX - r.left;
+  const n = points.length;
+  if(n<1) return;
+  const padL=10, padR=66, plotW=r.width-padL-padR;
+  let idx = Math.round((x-padL)/plotW*(n-1));
+  idx = Math.max(0, Math.min(n-1, idx));
+  if(idx !== hover){ hover = idx; render(); }
+});
+cv.addEventListener("mouseleave", ()=>{ hover = -1; render(); });
+
+function setMode(m, btnId){
+  mode = m;
+  ["btnTick","btn1m","btn5m","btn15m"].forEach(id=>document.getElementById(id).classList.remove("on"));
+  document.getElementById(btnId).classList.add("on");
+  hover = -1;
+  load();
+}
+document.getElementById("btnTick").onclick = ()=>setMode("tick","btnTick");
+document.getElementById("btn1m").onclick  = ()=>setMode("60","btn1m");
+document.getElementById("btn5m").onclick  = ()=>setMode("300","btn5m");
+document.getElementById("btn15m").onclick = ()=>setMode("900","btn15m");
+document.getElementById("goodSel").onchange = e=>{
+  good = e.target.value; hover = -1;
+  fetch(API+"/api/world/goods").then(r=>r.json()).then(j=>{
+    basePrice = j.data.find(g=>g.code===good).basePrice; load();
+  });
+};
+
+(async function init(){
+  await loadGoods();
+  await load();
+  setInterval(load, 5000);
+})();
+</script>
+</body>
+</html>

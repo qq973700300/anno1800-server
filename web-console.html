@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>纪元1800 后端联机控制台</title>
+<style>
+  :root{
+    --bg:#0f1620; --panel:#172231; --panel2:#1e2c3f; --line:#2b3b52;
+    --txt:#e6edf6; --dim:#8fa3bd; --gold:#f2c14e; --up:#e5484d; --down:#30a46c; --accent:#4c8dff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 "Microsoft YaHei",system-ui,sans-serif}
+  header{padding:12px 18px;background:linear-gradient(90deg,#172231,#1e2c3f);border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header h1{margin:0;font-size:17px;color:var(--gold);letter-spacing:1px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#666;display:inline-block}
+  .dot.on{background:#30a46c;box-shadow:0 0 8px #30a46c}
+  main{display:grid;grid-template-columns:minmax(420px,1fr) minmax(460px,1fr);gap:14px;padding:14px}
+  @media(max-width:1100px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
+  .card h2{margin:0 0 10px;font-size:14px;color:var(--gold);font-weight:600}
+  .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+  input,select,button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:6px 9px;font-size:13px;font-family:inherit}
+  button{cursor:pointer;background:#2a3d57;border-color:#3a5273}
+  button:hover{background:#34506f}
+  button.primary{background:#2f6b45;border-color:#3d8a59}
+  button.warn{background:#7a3b3b;border-color:#a04d4d}
+  input{width:110px}
+  input.wide{width:170px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{padding:5px 6px;border-bottom:1px solid #22314a;text-align:left;white-space:nowrap}
+  th{color:var(--dim);font-weight:500}
+  .up{color:var(--up)} .down{color:var(--down)} .dim{color:var(--dim)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11.5px;border:1px solid var(--line)}
+  .t-GROWING{color:#4c8dff;border-color:#2f4d7a} .t-RIPE{color:#30a46c;border-color:#2c6b4a}
+  .t-EMPTY{color:#8fa3bd} .t-WITHERED{color:#e5484d;border-color:#7a3b3b}
+  #events{height:300px;overflow:auto;background:#0c121b;border:1px solid var(--line);border-radius:8px;padding:8px;font-size:12.5px}
+  #events div{padding:3px 0;border-bottom:1px dashed #1c2839}
+  .log-ok{color:#8fd6a8} .log-err{color:#f08a8a} .log-ev{color:#9fc4ff}
+  .kv{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;color:var(--dim)}
+  .kv b{color:var(--txt);font-weight:600}
+  .scroll{max-height:260px;overflow:auto}
+  ::-webkit-scrollbar{width:8px;height:8px} ::-webkit-scrollbar-thumb{background:#2b3b52;border-radius:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚓ 纪元1800 · 后端联机控制台</h1>
+  <span><span id="wsDot" class="dot"></span> <span id="wsState" class="dim">未连接</span></span>
+  <span class="kv"><span>心跳 <b id="tick">-</b></span><span>在线 <b id="online">0</b></span><span>连接 <b id="conn">0</b></span></span>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>1. 玩家</h2>
+      <div class="row">
+        <input id="pName" class="wide" placeholder="公司名" value="南海贸易公司">
+        <button class="primary" onclick="register()">注册</button>
+        <span class="dim">当前：</span><select id="playerSel" onchange="onPlayerChange()"></select>
+      </div>
+      <div id="playerInfo" class="kv"></div>
+    </div>
+
+    <div class="card">
+      <h2>2. 岛屿 / 种植</h2>
+      <div class="row">
+        <input id="islandName" class="wide" placeholder="岛名(可空)" value="主岛">
+        <button class="primary" onclick="createIsland()">开新岛</button>
+        <select id="islandSel" onchange="refreshIsland()"></select>
+      </div>
+      <div class="row">
+        <select id="cropSel"></select>
+        <input id="plotX" type="number" value="10" style="width:56px" title="格子 X">
+        <input id="plotZ" type="number" value="10" style="width:56px" title="格子 Z">
+        <button onclick="plant()">播种</button>
+        <button class="primary" onclick="harvestAll()">收获全部成熟</button>
+        <button class="warn" onclick="clearAll()">清理枯萎</button>
+      </div>
+      <div id="plots" class="scroll"></div>
+    </div>
+
+    <div class="card">
+      <h2>3. 产业链与居民</h2>
+      <div class="row">
+        <select id="bTypeSel"></select>
+        <input id="bX" type="number" value="10" style="width:56px" title="占地左上角 X">
+        <input id="bZ" type="number" value="10" style="width:56px" title="占地左上角 Z">
+        <select id="bRotSel" title="大门朝向">
+          <option value="auto">大门自动吸附</option>
+          <option value="0">门朝南 0°</option>
+          <option value="90">门朝东 90°</option>
+          <option value="180">门朝北 180°</option>
+          <option value="270">门朝西 270°</option>
+        </select>
+        <button class="primary" onclick="build()">建造</button>
+      </div>
+      <div class="dim" id="bHint" style="margin:-4px 0 6px">厂房占地 2×2 ~ 4×4 格，x/z 是左上角；整块空地且外圈临路才能建。默认按邻近道路自动吸附大门朝向，也可手动指定横摆/竖摆。<b>贸易站是港口，只能建在岛最外圈的海岸带（沙滩）上，大门会自动朝海</b></div>
+      <div id="buildings" class="scroll"></div>
+
+      <h2 style="margin-top:12px">岛上居民</h2>
+      <div class="dim" id="popHint" style="margin:-4px 0 6px">—</div>
+      <div id="population"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>4. 商品贸易（NPC 市场）</h2>
+      <div class="row">
+        <select id="mGoodSel"></select>
+        <input id="mQty" type="number" value="10" style="width:80px">
+        <button class="primary" onclick="buy()">买入</button>
+        <button class="warn" onclick="sell()">卖出</button>
+      </div>
+      <div id="stock" class="scroll" style="margin-bottom:8px"></div>
+      <div id="market" class="scroll"></div>
+    </div>
+
+    <div class="card">
+      <h2>5. 玩家间挂单</h2>
+      <div class="row">
+        <select id="tSideSel"><option value="SELL">卖出</option><option value="BUY">买入</option></select>
+        <select id="tGoodSel"></select>
+        <input id="tQty" type="number" value="20" style="width:70px">
+        <input id="tPrice" type="number" value="20" style="width:80px" title="单价">
+        <button class="primary" onclick="createOffer()">挂单</button>
+      </div>
+      <div class="row">
+        <input id="takerId" type="number" placeholder="接单玩家ID" style="width:120px">
+        <button onclick="acceptFirst()">接首单</button>
+      </div>
+      <div id="offers" class="scroll"></div>
+    </div>
+
+    <div class="card">
+      <h2>世界事件流（WebSocket 实时）</h2>
+      <div id="events"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+/* 由服务器提供时自动用同源地址（手机/局域网访问同样可用）；本地双击打开时回落本机地址 */
+const IS_HTTP = location.protocol.startsWith("http");
+const API = IS_HTTP ? location.origin : "http://localhost:8080";
+const WS  = IS_HTTP ? ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws")
+                    : "ws://localhost:8080/ws";
+let ws = null, currentPlayer = null, plotCache = [], offerCache = [], popCache = null;
+
+/* ---------- 基础 ---------- */
+async function api(path, method, body){
+  const opt = {method: method||"GET", headers:{"Content-Type":"application/json"}};
+  if(body) opt.body = JSON.stringify(body);
+  const r = await fetch(API+path, opt);
+  const j = await r.json();
+  if(!j.ok) throw new Error(j.message||j.code);
+  return j.data;
+}
+const log = (msg, cls)=>{
+  const box = document.getElementById("events");
+  const d = document.createElement("div");
+  d.className = cls||"";
+  d.innerHTML = `<span class="dim">${new Date().toLocaleTimeString()}</span> ${msg}`;
+  box.prepend(d);
+  if(box.children.length>200) box.lastChild.remove();
+};
+async function tryApi(fn, okMsg){
+  try{ const d = await fn(); log(okMsg||"操作成功","log-ok"); return d; }
+  catch(e){ log("✗ "+e.message,"log-err"); return null; }
+}
+
+/* ---------- 初始化下拉 ---------- */
+async function loadConfig(){
+  const goods = await api("/api/world/goods");
+  const crops = goods.filter(g=>g.plantable);
+  fillSel("cropSel", crops.map(g=>({v:g.code,t:`${g.label}(${g.growthSeconds}s/产${g.yieldPerHarvest}/种${g.seedCost})`})));
+  fillSel("mGoodSel", goods.map(g=>({v:g.code,t:g.label+" ¥"+g.basePrice})));
+  fillSel("tGoodSel", goods.map(g=>({v:g.code,t:g.label+" ¥"+g.basePrice})));
+  const bs = await api("/api/world/buildings");
+  fillBuildSel(bs);
+}
+function fillSel(id, items){
+  const s = document.getElementById(id);
+  s.innerHTML = items.map(i=>`<option value="${i.v}">${i.t}</option>`).join("");
+}
+/** 建造下拉按用途分组（厂房 / 居民与港口）；住宅直接标出住多少人，省得翻建筑表才知道 */
+function fillBuildSel(list){
+  const label = b => b.kind === "RESIDENCE"
+    ? `${b.label}(¥${b.buildCost} · 住${b.residentCapacity}人)`
+    : b.kind === "HARBOR"
+      ? `${b.label}(¥${b.buildCost} · 港口·须建在海边)`
+      : `${b.label}(¥${b.buildCost}/${b.durationSeconds}s)`;
+  const opt = arr => arr.map(b=>`<option value="${b.code}">${label(b)}</option>`).join("");
+  const producers = list.filter(b => b.kind !== "RESIDENCE" && b.kind !== "HARBOR");
+  const residents = list.filter(b => b.kind === "RESIDENCE" || b.kind === "HARBOR");
+  document.getElementById("bTypeSel").innerHTML =
+    `<optgroup label="厂房">${opt(producers)}</optgroup>` +
+    (residents.length ? `<optgroup label="居民与港口">${opt(residents)}</optgroup>` : "");
+}
+
+/* ---------- 玩家 ---------- */
+async function register(){
+  const d = await tryApi(()=>api("/api/players/register","POST",{name:document.getElementById("pName").value}),
+    "✓ 注册成功");
+  if(d){ await loadPlayers(); selectPlayer(d.id); }
+}
+async function loadPlayers(){
+  const list = await api("/api/players");
+  fillSel("playerSel", list.map(p=>({v:p.id,t:`#${p.id} ${p.name}`})));
+}
+function selectPlayer(id){
+  document.getElementById("playerSel").value = id;
+  onPlayerChange();
+}
+async function onPlayerChange(){
+  currentPlayer = Number(document.getElementById("playerSel").value);
+  const p = await api("/api/players/"+currentPlayer);
+  document.getElementById("playerInfo").innerHTML =
+    `<span>ID <b>${p.id}</b></span><span>资金 <b>¥${p.treasury.toFixed(2)}</b></span><span>声望 <b>${p.reputation}</b></span><span class="dim">token ${p.token.slice(0,8)}…</span>`;
+  await refreshIslands(); refreshStock(); refreshOffers(); authWs(); startPopTimer();
+}
+
+/** 人口面板的轮询：人口是按结算周期慢慢涨的，盯着它动才有"养居民"的实感 */
+let popTimer = null;
+function startPopTimer(){
+  if(popTimer) return;
+  popTimer = setInterval(()=>{ if(currentPlayer) refreshPopulation(); }, 4000);
+}
+
+/* ---------- 岛屿 / 农田 ---------- */
+async function createIsland(){
+  const d = await tryApi(()=>api("/api/islands","POST",{
+    playerId:currentPlayer, name:document.getElementById("islandName").value}), "✓ 新岛屿已开辟");
+  if(d) await refreshIslands(d.id);
+}
+async function refreshIslands(pick){
+  const list = await api("/api/islands?playerId="+currentPlayer);
+  fillSel("islandSel", list.map(i=>({v:i.id,t:`#${i.id} ${i.name}(肥力${i.fertility} · 作物${i.plotCount}/${i.plotLimit})`})));
+  if(pick) document.getElementById("islandSel").value = pick;
+  await refreshIsland(); refreshBuildings(); refreshPopulation();
+}
+function islandId(){ return Number(document.getElementById("islandSel").value); }
+
+async function refreshIsland(){
+  if(!islandId()) return;
+  plotCache = await api("/api/islands/"+islandId()+"/plots");
+  renderPlots();
+}
+function renderPlots(){
+  document.getElementById("plots").innerHTML = plotCache.length ? `
+    <table><tr><th>格子</th><th>作物</th><th>状态</th><th>进度</th><th>预计产量</th><th>操作</th></tr>
+    ${plotCache.map(p=>`<tr>
+      <td>(${p.cellX}, ${p.cellZ})</td><td>${p.cropLabel||"-"}</td>
+      <td><span class="tag t-${p.state}">${p.state}</span></td>
+      <td>${(p.progress*100).toFixed(0)}%</td><td>${p.plannedYield||0}</td>
+      <td>${p.state==="RIPE"?`<button onclick="harvest(${p.id})">收获</button>`:""}
+          ${p.state==="WITHERED"?`<button class="warn" onclick="clearPlot(${p.id})">清理</button>`:""}</td>
+    </tr>`).join("")}</table>` : `<span class="dim">还没有作物：在上面填格子坐标（0~21），选好作物点「播种」</span>`;
+}
+async function plant(){
+  await tryApi(()=>api("/api/farm/plant","POST",{playerId:currentPlayer, islandId:islandId(),
+    x:Number(document.getElementById("plotX").value), z:Number(document.getElementById("plotZ").value),
+    crop:document.getElementById("cropSel").value}), "✓ 播种完成");
+  refreshIsland();
+}
+async function harvest(plotId){
+  const d = await tryApi(()=>api("/api/farm/harvest","POST",{playerId:currentPlayer, plotId}), null);
+  if(d) log(`✓ 收获 ${d.label} ×${d.yield}`,"log-ok");
+  refreshIsland(); refreshStock();
+}
+async function clearPlot(plotId){
+  await tryApi(()=>api("/api/farm/clear","POST",{playerId:currentPlayer, plotId}), "✓ 这一格已清理");
+  refreshIsland();
+}
+async function harvestAll(){
+  for(const p of plotCache.filter(x=>x.state==="RIPE")) await harvest(p.id);
+}
+async function clearAll(){
+  for(const p of plotCache.filter(x=>x.state==="WITHERED")) await clearPlot(p.id);
+}
+
+/* ---------- 建筑 ---------- */
+async function build(){
+  const rotSel = document.getElementById("bRotSel").value;
+  const body = {playerId:currentPlayer, islandId:islandId(),
+    type:document.getElementById("bTypeSel").value,
+    x:Number(document.getElementById("bX").value), z:Number(document.getElementById("bZ").value)};
+  if(rotSel !== "auto") body.rotation = Number(rotSel);   // 自动则交由服务端按最新路网吸附
+  await tryApi(()=>api("/api/buildings","POST",body), "✓ 建筑已落成");
+  refreshBuildings(); refreshPopulation();
+}
+async function demolish(id){
+  await tryApi(()=>api("/api/buildings/"+id+"?playerId="+currentPlayer,"DELETE"), "✓ 已拆除，返还一半造价");
+  refreshBuildings(); refreshPopulation();
+}
+async function rotate(id){
+  await tryApi(()=>api("/api/buildings/"+id+"/rotate","POST",{playerId:currentPlayer}), "✓ 已原地旋转 90°");
+  refreshBuildings();
+}
+const ROT_LABEL = {0:"南", 90:"东", 180:"北", 270:"西"};
+const KIND_LABEL = {PRODUCTION:"厂房", RESIDENCE:"住宅", HARBOR:"港口"};
+async function refreshBuildings(){
+  if(!islandId()) return;
+  const list = await api("/api/islands/"+islandId()+"/buildings");
+  document.getElementById("buildings").innerHTML = list.length ? `
+    <table><tr><th>建筑</th><th>占地</th><th>朝向</th><th>等级</th><th>进度</th><th>说明</th><th></th></tr>
+    ${list.map(b=>`<tr><td>${b.label}<br><span class="dim" style="font-size:10px">${KIND_LABEL[b.kind]||"厂房"}</span></td>
+      <td class="dim">${b.sizeW||1}×${b.sizeH||1}<br>(${b.gridX??"-"},${b.gridZ??"-"})</td>
+      <td class="dim">${b.rotation??0}° 门朝${ROT_LABEL[b.rotation??0]||"南"}</td>
+      <td>Lv.${b.level}</td>
+      <td>${b.kind==="PRODUCTION"
+            ? `${(b.progress*100).toFixed(0)}%${b.stalled?' <span class="up">缺料</span>':""}`
+            : '<span class="dim">—</span>'}</td>
+      <td class="dim">${b.recipe}</td>
+      <td><button onclick="rotate(${b.id})">旋转</button>${b.kind==="PRODUCTION"
+            ? `\n          <button onclick="upgrade(${b.id})">升级</button>` : ""}
+          <button class="warn" onclick="demolish(${b.id})">拆除</button></td></tr>`).join("")}</table>`
+    : `<span class="dim">尚无建筑</span>`;
+}
+
+/**
+ * 居民面板 —— 「港口 → 住宅 → 居民 → 需求 → 税收」这条循环跑没跑起来的唯一可视答案：
+ * 人数在涨说明需求被满足、税收在进账；满足度掉说明某项物资断了，人会开始搬走。
+ * 住宅与贸易站没有生产进度，所以这里的数字才是它们的"状态"。
+ */
+async function refreshPopulation(){
+  if(!islandId()) return;
+  try { popCache = await api("/api/islands/"+islandId()+"/population"); }
+  catch { popCache = null; }
+  renderPopulation();
+}
+function renderPopulation(){
+  const box = document.getElementById("population");
+  const hint = document.getElementById("popHint");
+  const p = popCache;
+  if(!p){ box.innerHTML = '<span class="dim">—</span>'; return; }
+  if(hint) hint.textContent = p.hasTradingPost
+    ? "顺序：贸易站 → 农夫小屋 → 备好口粮。居民会吃掉土豆/烈酒并交税，断供就会搬走"
+    : "还没有贸易站 —— 先建一座，否则居民不肯搬来";
+  const rows = (p.tiers||[]).filter(t=>t.built||t.unlocked);
+  if(!rows.length){ box.innerHTML = '<span class="dim">还没有住宅</span>'; return; }
+  box.innerHTML = `
+    <div class="dim" style="margin-bottom:6px">总人口 <b>${p.totalPopulation}</b> / ${p.totalCapacity}
+      · 税收 <b class="up">¥${p.taxPerMinute.toFixed(0)}</b>/分钟</div>
+    <table><tr><th>阶层</th><th>人口</th><th>满足度</th><th>税收/分</th><th>需求（每分钟 · 库存）</th></tr>
+    ${rows.map(t=>`<tr>
+      <td>${t.label}${t.unlocked?"":' <span class="up">未解锁</span>'}</td>
+      <td>${t.population} / ${t.capacity}</td>
+      <td>${(t.satisfaction*100).toFixed(0)}%</td>
+      <td>¥${t.taxPerMinute.toFixed(1)}</td>
+      <td class="dim">${(t.needs||[]).map(n=>{
+        const enough = n.stock >= n.requiredPerMinute;
+        return `${n.label} ${n.requiredPerMinute}/分（库存 ${n.stock}${enough?"":' <span class="up">缺</span>'}）`;
+      }).join(" · ") || "—"}</td>
+    </tr>`).join("")}</table>`;
+}
+async function upgrade(id){
+  await tryApi(()=>api("/api/buildings/"+id+"/upgrade","POST",{playerId:currentPlayer, buildingId:id}), "✓ 已升级");
+  refreshBuildings();
+}
+
+/* ---------- 市场 ---------- */
+async function buy(){
+  const g = document.getElementById("mGoodSel").value, q = Number(document.getElementById("mQty").value);
+  const d = await tryApi(()=>api("/api/market/buy","POST",{playerId:currentPlayer, good:g, quantity:q}), null);
+  if(d) log(`✓ 买入 ${d.label}×${d.quantity} @¥${d.unitPrice} 共 ¥${d.total}`,"log-ok");
+  refreshStock(); refreshMarket(); refreshPlayerInfo();
+}
+async function sell(){
+  const g = document.getElementById("mGoodSel").value, q = Number(document.getElementById("mQty").value);
+  const d = await tryApi(()=>api("/api/market/sell","POST",{playerId:currentPlayer, good:g, quantity:q}), null);
+  if(d) log(`✓ 卖出 ${d.label}×${d.quantity} @¥${d.unitPrice} 共 ¥${d.total}`,"log-ok");
+  refreshStock(); refreshMarket(); refreshPlayerInfo();
+}
+async function refreshStock(){
+  if(!currentPlayer) return;
+  const list = await api("/api/market/stock/"+currentPlayer);
+  document.getElementById("stock").innerHTML = list.length ?
+    `<div class="kv" style="margin-bottom:4px">${list.map(s=>`<span>${s.label} <b>${s.quantity}</b></span>`).join("")}</div>`
+    : `<span class="dim">仓库空空如也</span>`;
+}
+async function refreshMarket(){
+  const rows = await api("/api/market");
+  document.getElementById("market").innerHTML = `
+    <table><tr><th>商品</th><th>现价</th><th>涨跌幅</th><th>成交量</th></tr>
+    ${rows.map(r=>`<tr><td>${r.label}</td><td>¥${r.price.toFixed(2)}</td>
+      <td class="${r.changeRatio>=0?'up':'down'}">${(r.changeRatio*100).toFixed(2)}%</td>
+      <td class="dim">${r.volume}</td></tr>`).join("")}</table>`;
+}
+
+/* ---------- 挂单 ---------- */
+async function createOffer(){
+  await tryApi(()=>api("/api/trade/offers","POST",{playerId:currentPlayer,
+    side:document.getElementById("tSideSel").value, good:document.getElementById("tGoodSel").value,
+    quantity:Number(document.getElementById("tQty").value),
+    unitPrice:Number(document.getElementById("tPrice").value)}), "✓ 挂单已发布");
+  refreshStock(); refreshOffers(); refreshPlayerInfo();
+}
+async function refreshOffers(){
+  offerCache = await api("/api/trade/offers");
+  document.getElementById("offers").innerHTML = offerCache.length ? `
+    <table><tr><th>ID</th><th>卖家</th><th>方向</th><th>商品</th><th>数量</th><th>单价</th><th></th></tr>
+    ${offerCache.map(o=>`<tr><td>${o.id}</td><td>${o.playerName}</td>
+      <td class="${o.side==='SELL'?'up':'down'}">${o.side}</td><td>${o.label}</td>
+      <td>${o.remaining}/${o.quantity}</td><td>¥${o.unitPrice}</td>
+      <td><button onclick="accept(${o.id})">接单</button></td></tr>`).join("")}</table>`
+    : `<span class="dim">暂无挂单</span>`;
+}
+async function accept(id){
+  const taker = Number(document.getElementById("takerId").value||currentPlayer);
+  const d = await tryApi(()=>api("/api/trade/offers/"+id+"/accept","POST",{takerId:taker}), null);
+  if(d) log(`✓ 成交 #${d.offerId} ${d.good}×${d.quantity} @¥${d.unitPrice} 总额 ¥${d.total}`,"log-ok");
+  refreshOffers(); refreshStock(); refreshPlayerInfo();
+}
+async function acceptFirst(){
+  const mine = offerCache.filter(o=>o.playerId!==currentPlayer);
+  if(!mine.length){ log("没有可接的挂单","log-err"); return; }
+  document.getElementById("takerId").value = currentPlayer;
+  await accept(mine[0].id);
+}
+
+/* ---------- WebSocket 联机 ---------- */
+function connectWs(){
+  ws = new WebSocket(WS);
+  ws.onopen = ()=>{ document.getElementById("wsDot").classList.add("on");
+    document.getElementById("wsState").textContent = "已连接"; log("● 已连接到世界","log-ok"); authWs(); };
+  ws.onclose = ()=>{ document.getElementById("wsDot").classList.remove("on");
+    document.getElementById("wsState").textContent = "已断开，3秒后重连"; setTimeout(connectWs,3000); };
+  ws.onmessage = (e)=>{
+    const msg = JSON.parse(e.data);
+    if(msg.type==="world"){
+      const w = msg.data;
+      document.getElementById("tick").textContent = w.tick;
+      document.getElementById("online").textContent = w.onlinePlayers;
+      document.getElementById("conn").textContent = w.players.length;
+      if(document.getElementById("market").children.length) refreshMarket();
+    } else if(msg.type==="event"){
+      const ev = msg.data;
+      log(`⚡ ${ev.type} ${JSON.stringify(ev.payload||{}).slice(0,120)}`,"log-ev");
+      if(["CROP_RIPE","CROP_HARVESTED","CROP_WITHERED","CROP_PLANTED"].includes(ev.type)) refreshIsland();
+      if(["TRADE_OFFER","TRADE_FILLED"].includes(ev.type)) refreshOffers();
+      if(["MARKET_BUY","MARKET_SELL","PRODUCED"].includes(ev.type)){ refreshStock(); }
+    } else if(msg.type==="chat"){
+      log(`💬 ${msg.data.from}: ${msg.data.text}`);
+    }
+  };
+}
+function authWs(){
+  if(ws && ws.readyState===1 && currentPlayer) ws.send(JSON.stringify({type:"auth", playerId:currentPlayer}));
+}
+
+/* ---------- 启动 ---------- */
+async function refreshPlayerInfo(){
+  if(!currentPlayer) return;
+  const p = await api("/api/players/"+currentPlayer);
+  document.getElementById("playerInfo").innerHTML =
+    `<span>ID <b>${p.id}</b></span><span>资金 <b>¥${p.treasury.toFixed(2)}</b></span><span>声望 <b>${p.reputation}</b></span>`;
+}
+(async function init(){
+  await loadConfig();
+  await loadPlayers();
+  if(document.getElementById("playerSel").options.length){
+    await onPlayerChange();
+  } else { log("还没有玩家，点上面的【注册】创建第一个","log-ev"); }
+  await refreshMarket();
+  setInterval(refreshMarket, 5000);
+  setInterval(()=>{ if(document.getElementById("islandSel").value) refreshIsland(); }, 4000);
+  connectWs();
+})();
+</script>
+</body>
+</html>

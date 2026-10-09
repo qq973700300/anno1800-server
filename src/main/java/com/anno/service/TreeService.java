@@ -2,6 +2,7 @@ package com.anno.service;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -39,15 +40,18 @@ import com.anno.repo.TreeChopRepository;
  * coast-width 步）、山地、矿脉是<b>静态</b>的（地形决定，可缓存）；
  * 建筑 / 马路 / 农田占格是<b>动态</b>的（每次查询现算）—— 与客户端
  * "修路只移除路面那一棵、其他树纹丝不动"的稳定性同一套语义。
+ * <p>
+ * 【森林会复育】被砍的格子记在 {@code tree_chop}（一行 = 一格 + 复育时刻），
+ * 时刻一到这格就重新算"有树"—— 伐木场不用搬家，森林轮伐即可永续。
  */
 @Service
 public class TreeService {
 
-    /** 树的一格：坐标 + 到伐木场的距离（砍伐按"从近到远"排序） */
-    public record TreeCell(int x, int z, double dist) { }
+    /** 树的一格：坐标 + 到伐木场的距离（砍伐按"从近到远"排序）+ 复育时刻（0 = 非砍伐查询） */
+    public record TreeCell(int x, int z, double dist, long regrowAt) { }
 
-    /** 调试 / 下发快照：静态树集（纯地形推导）+ 已砍列表 */
-    public record TreeInfo(int staticCount, List<int[]> staticTrees, List<int[]> chopped) { }
+    /** 调试 / 下发快照：静态树集（纯地形推导）+ 已砍列表（[x, z, 复育时刻]） */
+    public record TreeInfo(int staticCount, List<int[]> staticTrees, List<long[]> chopped) { }
 
     private final TerrainService terrainService;
     private final TreeChopRepository chopRepository;
@@ -121,7 +125,9 @@ public class TreeService {
      * <p>
      * 对齐客户端 {@code buildTrees}：{@code density = min(1, 2800/陆地格数)} 是
      * <b>地形常量</b>（山、矿、海岸格都算陆地、都进分母 —— 与客户端 landCells 一致），
-     * {@code p = (0.06 + grove×0.5) × density}，{@code rand ≤ p} 长树。
+     * {@code p = max(0, (grove - 0.35) × 0.85) × density} —— 纪元式<strong>成片森林</strong>：
+     * 林区强度不到 0.35 的空地一树不长，深林区（grove→1） probability ≈ 0.55×density；
+     * 噪声频率 0.05 让林区斑块直径放大到 ~18 格，一眼就是"一片森林"。
      */
     public boolean[] staticTreeGrid(long islandId) {
         return staticCache.computeIfAbsent(islandId, id -> computeStatic(id, terrainService.of(id)));
@@ -142,8 +148,8 @@ public class TreeService {
                 if (map.isCoast(x, z, coast)) continue;                 // 沙滩不长树
                 if (c == TerrainMap.MOUNTAIN) continue;                 // 山地不长树
                 if (c == TerrainMap.IRON || c == TerrainMap.CLAY) continue; // 矿脉露出来
-                double grove = smoothNoise(x * 0.09 + 3.1, z * 0.09 + 8.7);
-                double p = (0.06 + grove * 0.5) * density;
+                double grove = smoothNoise(x * 0.05 + 3.1, z * 0.05 + 8.7);
+                double p = Math.max(0, (grove - 0.35) * 0.85) * density; // 只有林区才长树（与客户端同判式）
                 if (seededRand(cellHash(x, z, seedBase)) > p) continue; // rand ≤ p 才长（与客户端同判式）
                 grid[z * size + x] = true;
             }
@@ -157,14 +163,16 @@ public class TreeService {
 
     /**
      * 伐木场半径内的<b>现存</b>树，按距离从近到远排序。
-     * 建筑占地 / 马路 / 农田上的树不算（长不出来），已砍的不算（永久消失）。
+     * 建筑占地 / 马路 / 农田上的树不算（长不出来）；被砍的格子要等树苗复育期满
+     * （{@code regrowAt} 之前不算树）—— 补种让森林成为可再生资源。
      */
     @Transactional(readOnly = true)
     public List<TreeCell> availableTreesNear(BuildingEntity mill, double radius) {
         TerrainMap map = terrainService.of(mill.getIslandId());
         boolean[] grid = staticTreeGrid(mill.getIslandId());
         Set<Long> blocked = occupiedCells(mill.getIslandId());
-        Set<Long> chopped = chopKeys(mill.getIslandId());
+        Map<Long, Long> chopAt = chopTimes(mill.getIslandId());
+        long now = System.currentTimeMillis();
         int size = map.size();
         double cx = mill.getGridX() + mill.getSizeW() / 2.0;
         double cz = mill.getGridZ() + mill.getSizeH() / 2.0;
@@ -177,8 +185,10 @@ public class TreeService {
                 if (!grid[z * size + x]) continue;
                 double d = Math.hypot(x + 0.5 - cx, z + 0.5 - cz);
                 if (d > radius) continue;
-                if (blocked.contains(key(x, z)) || chopped.contains(key(x, z))) continue;
-                out.add(new TreeCell(x, z, d));
+                if (blocked.contains(key(x, z))) continue;
+                Long rg = chopAt.get(key(x, z));
+                if (rg != null && rg > now) continue;   // 树苗还没长成：这格暂时没树
+                out.add(new TreeCell(x, z, d, 0L));
             }
         }
         out.sort(Comparator.comparingDouble(TreeCell::dist));
@@ -186,8 +196,8 @@ public class TreeService {
     }
 
     /**
-     * 砍掉半径内<b>最近</b>的一棵树，返回被砍的格子；半径内没树返回 {@code null}。
-     * 唯一约束兜底并发：同一格永远只有一行砍伐记录。
+     * 砍掉半径内<b>最近</b>的一棵树，返回被砍的格子（带复育时刻）；半径内没树返回 {@code null}。
+     * 唯一约束兜底并发：同一格永远只有一行砍伐记录（复育不改行，只看时间）。
      */
     @Transactional
     public TreeCell chopNearest(BuildingEntity mill, double radius) {
@@ -195,8 +205,9 @@ public class TreeService {
         if (trees.isEmpty()) return null;
         TreeCell t = trees.get(0);
         if (chopRepository.existsByIslandIdAndCellXAndCellZ(mill.getIslandId(), t.x(), t.z())) return null;
-        chopRepository.save(new TreeChopEntity(mill.getIslandId(), t.x(), t.z()));
-        return t;
+        long regrowAt = System.currentTimeMillis() + props.getLumberRegrowMinutes() * 60_000L;
+        chopRepository.save(new TreeChopEntity(mill.getIslandId(), t.x(), t.z(), regrowAt));
+        return new TreeCell(t.x(), t.z(), t.dist(), regrowAt);
     }
 
     /** 半径内现存树的数量（停产判定用，省得把整棵列表搬回去） */
@@ -205,7 +216,7 @@ public class TreeService {
         return availableTreesNear(mill, radius).size();
     }
 
-    /** 调试 / 客户端加载用：静态树集 + 砍伐记录 */
+    /** 调试 / 客户端加载用：静态树集 + 砍伐记录（含复育时刻，0 = 老档早已复育） */
     @Transactional(readOnly = true)
     public TreeInfo info(long islandId) {
         boolean[] grid = staticTreeGrid(islandId);
@@ -216,8 +227,8 @@ public class TreeService {
                 if (grid[z * size + x]) staticTrees.add(new int[]{x, z});
             }
         }
-        List<int[]> chopped = chopRepository.findByIslandId(islandId).stream()
-                .map(c -> new int[]{c.getCellX(), c.getCellZ()}).toList();
+        List<long[]> chopped = chopRepository.findByIslandId(islandId).stream()
+                .map(c -> new long[]{c.getCellX(), c.getCellZ(), c.getRegrowAt()}).toList();
         return new TreeInfo(staticTrees.size(), staticTrees, chopped);
     }
 
@@ -239,9 +250,10 @@ public class TreeService {
         return out;
     }
 
-    private Set<Long> chopKeys(long islandId) {
-        Set<Long> out = new HashSet<>();
-        chopRepository.findByIslandId(islandId).forEach(c -> out.add(key(c.getCellX(), c.getCellZ())));
+    /** 砍伐记录：格子 → 复育时刻（ms 纪元）。时刻已过的格子视为树已长回 */
+    private Map<Long, Long> chopTimes(long islandId) {
+        Map<Long, Long> out = new HashMap<>();
+        chopRepository.findByIslandId(islandId).forEach(c -> out.put(key(c.getCellX(), c.getCellZ()), c.getRegrowAt()));
         return out;
     }
 

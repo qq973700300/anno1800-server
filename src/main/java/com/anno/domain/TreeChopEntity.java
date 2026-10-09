@@ -16,8 +16,9 @@ import jakarta.persistence.UniqueConstraint;
  * 算出同一片初始森林，不需要落库。真正会变的只有"哪些格子被砍了" ——
  * 一条砍伐记录一个格子，存档轻、老档零迁移。
  * <p>
- * 【树不再生】纪元1800 的森林是一次性资源：砍掉一格就永远少一格
- * （表里的一行就是"这格以后永远没有树"），伐木场周围的树砍光就得换地方。
+ * 【树会复育】纪元式补种林业：砍掉一格后，树苗会在 {@link #regrowAt} 时刻长回成树
+ * （一行 = "这格在复育时刻之前没有树"，时刻一过这格重新算有树，行不删除 ——
+ * 存档轻、同一格历史只有一条）。伐木场不用搬家，轮伐即可永续。
  */
 @Entity
 @Table(name = "tree_chop",
@@ -40,14 +41,19 @@ public class TreeChopEntity {
     @Column(nullable = false)
     private long choppedAt;
 
+    /** 树苗长回成树的时刻（ms 纪元）。老档迁移补 0 = 早已复育 */
+    @Column(nullable = false)
+    private long regrowAt;
+
     protected TreeChopEntity() {
     }
 
-    public TreeChopEntity(Long islandId, int cellX, int cellZ) {
+    public TreeChopEntity(Long islandId, int cellX, int cellZ, long regrowAt) {
         this.islandId = islandId;
         this.cellX = cellX;
         this.cellZ = cellZ;
         this.choppedAt = System.currentTimeMillis();
+        this.regrowAt = regrowAt;
     }
 
     public Long getId() { return id; }
@@ -55,4 +61,5 @@ public class TreeChopEntity {
     public int getCellX() { return cellX; }
     public int getCellZ() { return cellZ; }
     public long getChoppedAt() { return choppedAt; }
+    public long getRegrowAt() { return regrowAt; }
 }

@@ -139,6 +139,11 @@ public class GameProperties {
     private double lumberChopRadius = 8;
     /** 每砍 1 棵树对应的产木数：产 2 木消耗 1 棵树（欠账累积，不足不砍） */
     private int woodPerTree = 2;
+    /**
+     * 树苗复育时长（分钟）：被砍的格子过了这么久重新长回成树。
+     * 森林因此是<b>可再生</b>资源 —— 伐木场不用拆了搬家，规划两片林区轮伐即可。
+     */
+    private long lumberRegrowMinutes = 10;
 
     /** 马车满载量 */
     public int getCartLoad() { return cartLoad; }
@@ -154,6 +159,8 @@ public class GameProperties {
     public double getLumberChopRadius() { return lumberChopRadius; }
     /** 每砍 1 棵树的产木数 */
     public int getWoodPerTree() { return woodPerTree; }
+    /** 树苗复育时长（分钟） */
+    public long getLumberRegrowMinutes() { return lumberRegrowMinutes; }
 
     /**
      * 格子是否在网格范围内。

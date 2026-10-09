@@ -10,10 +10,12 @@
  * 运行：node tools/lumber-check.mjs（需要服务已启动，timeScale=1）
  */
 import puppeteer from 'file:///C:/Users/92112/.workbuddy/binaries/node/workspace/node_modules/puppeteer-core/lib/puppeteer/puppeteer-core.js';
+import { spawn } from 'child_process';
 
 const BASE = 'http://127.0.0.1:8080';
 const WS = BASE.replace(/^http/, 'ws') + '/ws';
 const CELL = 1.7;
+const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const NAME = '伐木验证' + Date.now();
 let pass = 0, fail = 0, skip = 0;
 const check = (name, ok, detail = '') => {
@@ -23,6 +25,33 @@ const check = (name, ok, detail = '') => {
 const skipIt = (name, why) => { console.log('  - ' + name + ' —— 跳过：' + why); skip++; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const key = (x, z) => x + ',' + z;
+
+/** Edge 154 起：桌面 Edge 已有实例在跑时，新进程会把活儿移交出去后立刻退出（exit 0），
+    puppeteer 把"启动进程退出"误判成启动失败。兜底：自管无头进程 + 调试端口连接。 */
+const DBG_PORT = 9223;
+async function launchBrowser() {
+  try {
+    return { browser: await puppeteer.launch({
+      executablePath: EDGE,
+      headless: 'new',
+      args: ['--headless=new', '--enable-unsafe-swiftshader', '--use-angle=swiftshader', '--no-sandbox', '--window-size=1280,800'],
+    }) };
+  } catch (e) {
+    const prof = `C:/Users/92112/AppData/Local/Temp/pptr-anno-${Date.now()}`;
+    const child = spawn(EDGE, ['--headless=new', '--enable-unsafe-swiftshader', '--use-angle=swiftshader',
+      '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+      `--user-data-dir=${prof}`, `--remote-debugging-port=${DBG_PORT}`, '--window-size=1280,800', 'about:blank'],
+      { stdio: 'ignore' });
+    for (let i = 0; i < 40; i++) {
+      await sleep(500);
+      try {
+        const res = await fetch(`http://127.0.0.1:${DBG_PORT}/json/version`);
+        if (res.ok) return { browser: await puppeteer.connect({ browserURL: `http://127.0.0.1:${DBG_PORT}` }), child };
+      } catch { /* 还没起好，继续等 */ }
+    }
+    throw new Error('Edge 无头实例 20s 内没起来');
+  }
+}
 
 const api = async (path, method, body) => {
   const r = await fetch(BASE + path, { method: method || 'GET', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
@@ -101,11 +130,7 @@ if (!best) { console.log('  ✗ 整岛找不到 2×2 无树落点，退出'); pr
 console.log(`伐木场 1 落点 (${best.ax},${best.az}) 半径 8 内 ${best.n} 棵树；稀疏候选 ${sparse ? `(${sparse.ax},${sparse.az}) ${sparse.n} 棵` : '无'}`);
 
 /* 无头进岛（树集对拍 + 客户端砍树演出） */
-const browser = await puppeteer.launch({
-  executablePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-  headless: 'new',
-  args: ['--headless=new', '--enable-unsafe-swiftshader', '--use-angle=swiftshader', '--no-sandbox', '--window-size=1280,800'],
-});
+const { browser, child } = await launchBrowser();
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
@@ -226,7 +251,8 @@ try {
     check('F2 伐木场停摆（stalled=true）', b2 && b2.stalled === true, `stalled=${b2 && b2.stalled}`);
   } else skipIt('F1-F2 砍光停产', '平岛上找不到半径 8 内 ≤3 棵树的窗口');
 } finally {
-  await browser.close();
+  await browser.close().catch(() => {});
+  try { child && child.kill(); } catch { /* 进程可能已随 close 退出 */ }
 }
 
 console.log(`\n结果：${pass} 过 / ${fail} 挂${skip ? ' / ' + skip + ' 跳过' : ''}`);

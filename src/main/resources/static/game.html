@@ -226,9 +226,6 @@
 
 <div id="left" class="panel">
   <div class="sect"><h3>选中目标</h3><div id="selBox"></div></div>
-  <div class="sect"><h3>岛上居民 <span id="popHint" class="muted" style="font-size:10.5px;font-weight:400"></span></h3>
-    <div id="popBox"></div>
-  </div>
 </div>
 
 <div id="right" class="panel">
@@ -703,7 +700,7 @@ function onGameEvent(e) {
      挥斧触发 —— 没工人在场才立即兜底演出（不 toast —— 10 秒一条太吵） */
   if (e.type === 'TREE_CHOPPED') {
     const p = e.payload || {};
-    if (!S.island || p.islandId === S.island.id) chopTreeAt(p.x, p.z, p.buildingId);
+    if (!S.island || p.islandId === S.island.id) chopTreeAt(p.x, p.z, p.buildingId, p.regrowAt);
   }
   /* 满仓滞留：门口那辆车标成 stuck —— 兜底收车跳过它，等 ARRIVED 再演回程 */
   if (e.type === 'WAREHOUSE_FULL' && e.payload) {
@@ -3246,6 +3243,33 @@ const TREE_MAX = 1600;
    swap-remove（尾部实例补位）保证 O(1)，meta 表记住补位实例原来的格子改指向 */
 const treeCellIndex = new Map();   // 'x,z' -> 实例序号
 const treeMeta = new Map();        // 实例序号 -> 'x,z'
+const treeCells = new Set();       // 画面上有树的格子（选中面板"这里是一棵树"用）
+
+/* ---- 补种（纪元式可持续林业）----
+   被砍的格子进队列：树苗从 12% 尺寸渐长回成树（默认 10 分钟，服务端事件带权威 regrowAt）。
+   长成后移出队列 —— 之后任何场景重建都按"普通树"渲染，账目自然对齐；
+   重建（buildTrees）时队列里的树苗从队列表恢复矩阵，不重不漏。
+   服务端 lumberRegrowMinutes=10；这里只是收不到事件时的兜底时长。 */
+const regrowQueue = new Map();
+const TREE_REGROW_MS = 600000;
+
+/** 树苗成长进度 0..1（由服务端砍伐/复育时刻推算，客户端只做插值） */
+function regrowK(e) {
+  return Math.min(1, Math.max(0, (Date.now() - e.startMs) / Math.max(1, e.endMs - e.startMs)));
+}
+/** 把成长中的树苗挂到 InstancedMesh 的 idx 槽位（姿态 = 该格成树的确定性哈希姿态） */
+function placeRegrowInstance(e, idx) {
+  if (idx >= TREE_MAX) return;
+  const d = new THREE.Object3D();
+  d.position.set(e.wx, e.wy, e.wz);
+  d.rotation.set(0, e.rot, 0);
+  d.scale.setScalar(Math.max(0.02, e.s * (0.12 + 0.88 * regrowK(e))));
+  d.updateMatrix();
+  trunkMesh.setMatrixAt(idx, d.matrix);
+  leafMesh.setMatrixAt(idx, d.matrix);
+  const key = keyOf(e.x, e.z);
+  treeCellIndex.set(key, idx); treeMeta.set(idx, key);
+}
 
 function seededRand(seed) {
   let t = seed + 0x6D2B79F5;
@@ -3260,8 +3284,8 @@ function cellHash(c, seed) {
 }
 function buildTrees() {
   treeGroup.clear();
-  treeCellIndex.clear(); treeMeta.clear();
-  if (!S.treeChops) S.treeChops = new Set();   // 树账未到位（换岛过渡帧）：先当没砍过，账到了会重建
+  treeCellIndex.clear(); treeMeta.clear(); treeCells.clear();
+  if (!S.treeChops) S.treeChops = new Map();   // 树账未到位（换岛过渡帧）：先当没砍过，账到了会重建
   if (!trunkMesh) {
     const trunkGeo = new THREE.CylinderGeometry(0.11, 0.15, 0.9, 6); trunkGeo.translate(0, 0.45, 0);
     const leafGeo = new THREE.ConeGeometry(0.72, 1.9, 7); leafGeo.translate(0, 1.25, 0);
@@ -3287,12 +3311,14 @@ function buildTrees() {
   for (const c of landCells) {
     if (n >= TREE_MAX) break;                            // 安全阀：InstancedMesh 容量上限
     if (plotCells.has(keyOf(c.x, c.z)) || hasRoad(c.x, c.z) || bldCells.has(keyOf(c.x, c.z))) continue;
-    if (S.treeChops.has(keyOf(c.x, c.z))) continue;      // 已砍的格子永远不长树（服务端 tree_chop 同一套账）
+    const rg = S.treeChops.get(keyOf(c.x, c.z));
+    if (rg != null && Date.now() < rg) continue;          // 已砍未复育：这格暂时不长树（补种账同服务端 tree_chop）
+    if (regrowQueue.has(keyOf(c.x, c.z))) continue;       // 树苗成长中：由补种队列负责渲染，主循环不重复放
     if (isCoastCell(c.x, c.z)) continue;                 // 沙滩上不长树：海岸带要留给港口，也得让人一眼看清"海边在哪"
     if (isMountainCell(c.x, c.z)) continue;              // 山地地表比平地高，树按平地高度放会被山体埋半截
     if (oreAtCell(c.x, c.z) !== TERRAIN.PLAIN) continue; // 矿脉上不盖树：矿要露出来给人看见
-    const grove = smoothNoise(c.x * 0.09 + 3.1, c.z * 0.09 + 8.7);       // 0..1 林区强度
-    const p = (0.06 + grove * 0.5) * density;                            // 密林区 ~11% / 草地 ~1%（面积归一后）
+    const grove = smoothNoise(c.x * 0.05 + 3.1, c.z * 0.05 + 8.7);       // 0..1 林区强度（0.05 低频 → 斑块 ~18 格成片）
+    const p = Math.max(0, (grove - 0.35) * 0.85) * density;              // 纪元式成片森林：空地 0% / 深林区 ~55%，与服务端 computeStatic 同判式
     if (seededRand(cellHash(c, seedBase)) > p) continue;
     const jx = (seededRand(cellHash(c, seedBase) + 1) - 0.5) * CELL * 0.5;
     const jz = (seededRand(cellHash(c, seedBase) + 2) - 0.5) * CELL * 0.5;
@@ -3304,7 +3330,13 @@ function buildTrees() {
     trunkMesh.setMatrixAt(n, d.matrix);
     leafMesh.setMatrixAt(n, d.matrix);
     treeCellIndex.set(keyOf(c.x, c.z), n); treeMeta.set(n, keyOf(c.x, c.z));
+    treeCells.add(keyOf(c.x, c.z));
     n++;
+  }
+  /* 场景重建后把成长中的树苗重新挂回 InstancedMesh（槽位排在主循环之后，账目同一套索引） */
+  for (const e of regrowQueue.values()) {
+    if (n >= TREE_MAX) break;
+    placeRegrowInstance(e, n); n++;
   }
   trunkMesh.count = n; leafMesh.count = n;
   trunkMesh.instanceMatrix.needsUpdate = true;
@@ -3329,12 +3361,27 @@ function removeTreeInstance(idx, key) {
   trunkMesh.instanceMatrix.needsUpdate = true;
   leafMesh.instanceMatrix.needsUpdate = true;
   treeCellIndex.delete(key); treeMeta.delete(last);
+  treeCells.delete(key);
 }
 
-function chopTreeAt(x, z, buildingId) {
+function chopTreeAt(x, z, buildingId, regrowAt) {
   if (x == null || z == null) return;
   const key = keyOf(x, z);
-  if (S.treeChops) S.treeChops.add(key);      // 账本同步：之后重建场景这格也不再长树
+  const end = Number(regrowAt) > 0 ? Number(regrowAt) : Date.now() + TREE_REGROW_MS;
+  if (S.treeChops) S.treeChops.set(key, end);  // 账本同步：复育期满前这格不再长树（服务端 tree_chop 同一套账）
+  /* 排一棵树苗：就在原格从 12% 渐长回成树（位置/姿态 = 成树的确定性哈希值，
+     长成后移出队列，之后任何重建都按普通树渲染）—— 与视野无关，先记账再演 */
+  const seedBase = (S.island ? S.island.id : 1) * 7919;
+  const h = cellHash({ x, z }, seedBase);
+  const [wx, wz] = cellToWorld(x, z);
+  regrowQueue.set(key, {
+    x, z, startMs: Date.now(), endMs: end,
+    wx: wx + (seededRand(h + 1) - 0.5) * CELL * 0.5,
+    wy: TOP_Y + cellH(x, z) + 0.05,
+    wz: wz + (seededRand(h + 2) - 0.5) * CELL * 0.5,
+    rot: seededRand(h + 3) * Math.PI * 2,
+    s: 0.75 + seededRand(h + 4) * 0.5,
+  });
   if (!trunkMesh) return;
   const idx = treeCellIndex.get(key);
   if (idx === undefined || idx >= trunkMesh.count) return;   // 不在这片视野（远岛 / 已重建）
@@ -3344,6 +3391,46 @@ function chopTreeAt(x, z, buildingId) {
   /* 倒树演出归伐木工：有工人在岗就排进他的活儿（跑过去挥斧，斧落树倒）；
      没有工人（在跑/缺工人/深夜）→ 立即兜底演出，树该倒还是倒 */
   if (!(buildingId != null && dispatchChop(buildingId, pos))) spawnChopFx(pos);
+}
+
+/** 进岛 / 重连后恢复成长中的树苗：按账里的复育时刻 + 确定性哈希重算位置与姿态
+    （startMs 用 endMs - TREE_REGROW_MS 近似 —— 服务端时长就是它，误差可忽略） */
+function rebuildRegrowQueue() {
+  regrowQueue.clear();
+  if (!S.island || !S.treeChops) return;
+  const seedBase = S.island.id * 7919;
+  for (const [key, end] of S.treeChops) {
+    const [x, z] = key.split(',').map(Number);
+    const h = cellHash({ x, z }, seedBase);
+    const [wx, wz] = cellToWorld(x, z);
+    regrowQueue.set(key, {
+      x, z, startMs: end - TREE_REGROW_MS, endMs: end,
+      wx: wx + (seededRand(h + 1) - 0.5) * CELL * 0.5,
+      wy: TOP_Y + cellH(x, z) + 0.05,
+      wz: wz + (seededRand(h + 2) - 0.5) * CELL * 0.5,
+      rot: seededRand(h + 3) * Math.PI * 2,
+      s: 0.75 + seededRand(h + 4) * 0.5,
+    });
+  }
+}
+
+/** 每帧驱动树苗渐大：只改自己槽位的矩阵，长成即移出队列（实例保持成树尺寸） */
+function tickRegrow() {
+  if (!trunkMesh || regrowQueue.size === 0) return;
+  const d = new THREE.Object3D();
+  for (const [key, e] of regrowQueue) {
+    if (regrowK(e) >= 1) { regrowQueue.delete(key); treeCells.add(key); continue; }   // 长成了：以后按普通树渲染
+    const idx = treeCellIndex.get(key);
+    if (idx === undefined || idx >= trunkMesh.count) continue;
+    d.position.set(e.wx, e.wy, e.wz);
+    d.rotation.set(0, e.rot, 0);
+    d.scale.setScalar(Math.max(0.02, e.s * (0.12 + 0.88 * regrowK(e))));
+    d.updateMatrix();
+    trunkMesh.setMatrixAt(idx, d.matrix);
+    leafMesh.setMatrixAt(idx, d.matrix);
+    trunkMesh.instanceMatrix.needsUpdate = true;
+    leafMesh.instanceMatrix.needsUpdate = true;
+  }
 }
 
 const chopFx = [];
@@ -4664,7 +4751,13 @@ function renderSel() {
   const road = hasRoad(x, z);
   const bld = bldCells.get(keyOf(x, z));
   const crop = plotCells.get(keyOf(x, z));
-  const badge = road ? '🛣️ 马路' : bld ? '🏭 建筑用地' : crop ? '🌾 作物' : '🌿 空地';
+  /* 空地也要说清"这里是什么"：树 / 成长中的树苗 / 身边正好站着的小动物 */
+  const cellKey = keyOf(x, z);
+  const faunaHere = (!road && !bld && !crop) ? nearestFauna(x, z) : null;
+  const badge = road ? '🛣️ 马路' : bld ? '🏭 建筑用地' : crop ? '🌾 作物'
+    : regrowQueue.has(cellKey) ? '🌱 树苗成长中'
+    : treeCells.has(cellKey) ? '🌳 树木'
+    : faunaHere || '🌿 空地';
   let h = `<div class="row"><span>格子 (${x}, ${z})</span><span>${badge}</span></div>`;
 
   /* 这一格种着东西：显示作物状态 + 收获 / 清理 */
@@ -4705,11 +4798,33 @@ function renderSel() {
 
   /* 空格子：只报"这一格本身是什么"，不弹任何建造相关的东西。
      建造卡常驻在底部工具条上（#toolBar，见 renderToolBar）——点一下拿在手里，再点到岛上放下。 */
+  if (regrowQueue.has(cellKey)) {
+    const e = regrowQueue.get(cellKey);
+    const leftMin = Math.max(1, Math.ceil((e.endMs - Date.now()) / 60000));
+    h += `<div class="muted" style="font-size:11.5px;margin-top:4px">被砍过的格子正在补种，约 ${leftMin} 分钟后长回成树</div>`;
+  } else if (treeCells.has(cellKey)) {
+    h += `<div class="muted" style="font-size:11.5px;margin-top:4px">森林的一角：伐木场会来砍，砍完原地补种（约 10 分钟长回）</div>`;
+  } else if (faunaHere) {
+    h += `<div class="muted" style="font-size:11.5px;margin-top:4px">正好有一只小动物站在这格附近</div>`;
+  }
   if (isCoastCell(x, z)) {
     h += `<div class="muted" style="font-size:11.5px;margin-top:6px;color:var(--gold)">`
        + `这一格是<b>海岸带</b>（岛最外 ${COAST} 圈沙滩）</div>`;
   }
   box.innerHTML = h;
+}
+
+/** 离这格最近的小动物（1.2 格内算"站在这"），返回它的名字；没有则 null */
+function nearestFauna(x, z) {
+  const [wx, wz] = cellToWorld(x, z);
+  let best = null, bd = 1.2 * CELL;
+  for (const list of [sheep, deer, bears]) {
+    for (const a of list) {
+      const d = Math.hypot(a.g.position.x - wx, a.g.position.z - wz);
+      if (d < bd) { bd = d; best = a; }
+    }
+  }
+  return best ? best.label : null;
 }
 
 /**
@@ -4749,53 +4864,9 @@ function tierPop(tier) {
 /** 岛上现有农夫人口 */
 function farmerCount() { return tierPop('FARMER'); }
 
-/**
- * 岛上居民面板 —— 「居民经济跑没跑起来」的唯一可视答案：
- * 人口在涨说明需求被满足、税收在进账；满足度掉说明某项物资断了，人会开始搬走。
- */
-function renderPopulation() {
-  const box = document.getElementById('popBox');
-  if (!box) return;
-  const hint = document.getElementById('popHint');
-  const p = S.population;
-  if (!p) {
-    box.innerHTML = '<span class="muted" style="font-size:11.5px">—</span>';
-    if (hint) hint.textContent = '';
-    return;
-  }
-  if (hint) hint.textContent = p.hasTradingPost ? '' : '没有贸易站就没人来';
-
-  const rows = (p.tiers || []).filter(t => t.built || t.unlocked);
-  if (!rows.length) {
-    /* 没住宅就只报状态数字，不再放"先建什么后建什么"的引导文案 */
-    box.innerHTML = `<div class="muted" style="font-size:11.5px">总人口 `
-      + `<b style="color:var(--text)">${p.totalPopulation || 0}</b>/${p.totalCapacity || 0} · 税收 `
-      + `<b style="color:var(--gold)">¥${(p.taxPerMinute || 0).toFixed(0)}</b>/分</div>`;
-    return;
-  }
-  const head = `<div class="muted" style="font-size:11.5px;margin-bottom:6px">总人口 `
-    + `<b style="color:var(--text)">${p.totalPopulation}</b>/${p.totalCapacity} · 税收 `
-    + `<b style="color:var(--gold)">¥${(p.taxPerMinute || 0).toFixed(0)}</b>/分</div>`;
-
-  box.innerHTML = head + rows.map(t => {
-    const pct = Math.round((t.satisfaction || 0) * 100);
-    const col = pct >= 90 ? '#7cc47f' : pct >= 60 ? '#e6b34d' : '#e06a6a';
-    const needs = (t.needs || []).map(n => {
-      const enough = n.stock >= n.requiredPerMinute;
-      return `<span style="color:${enough ? 'var(--dim)' : '#e06a6a'}">${n.label} ${n.requiredPerMinute}/分${enough ? '' : ' ✗缺'}</span>`;
-    }).join(' · ');
-    const lock = t.unlocked ? '' : '<span style="color:#e6b34d">未解锁</span>';
-    return `<div style="margin-bottom:7px">
-      <div style="display:flex;gap:6px;align-items:baseline">
-        <b style="font-size:12px">${t.label}</b>
-        <span class="muted" style="font-size:11.5px">${t.population}/${t.capacity} 人</span>
-        ${lock}
-        <span style="margin-left:auto;font-size:11.5px;color:${col}">满足 ${pct}%</span>
-      </div>
-      <div style="font-size:11px;margin-top:1px">${needs || '<span class="muted">无需求</span>'}</div>
-    </div>`;
-  }).join('');
-}
+/* 【岛上居民面板已删】（纪元 1800 左侧没有常驻人口面板）：总人口/满足度/缺货
+   平时不再常驻左栏 —— 房子幸福度由头顶状态牌表达（😠 幸福度 XX%），
+   点住宅建筑看工人与产能。S.population 仍是状态牌的数据源，保留不删。 */
 
 function renderMarket() {
   const rows = (S.market || []).map(m => {
@@ -4926,6 +4997,7 @@ function applyIslands(list) {
   ROAD_COST = S.island.roadCost; PLOT_LIMIT = S.island.plotLimit;
   if (switched) {                       // 换岛：整个场景重建
     S.treeChops = null;                 // 树账跟着岛换：等 refreshTreeChops 拉新账再重建森林
+    regrowQueue.clear();                // 上一座岛的树苗队列一并作废
     buildIslandMesh(); buildGrid(); buildPlots([]);
     dist = GRID * CELL * 1.5; updateCamera();
     syncNpcs();                         // 换岛 = 居民全换一批（sync 内部按 islandId 清空重来）
@@ -4946,12 +5018,18 @@ async function refreshIslands() {
   applyIslands(list);
 }
 
-/** 树账：服务端的砍伐记录（哪些格子永远没了树）。必须在任何 buildTrees 之前就位 ——
-    进岛流程里排在 refreshRoads/refreshBuildings（它们会触发 buildTrees）之前 */
+/** 树账：服务端的砍伐记录（[x, z, 复育时刻]；复育时刻已过的格子视为树已长回）。
+    必须在任何 buildTrees 之前就位 —— 进岛流程里排在 refreshRoads/refreshBuildings
+    （它们会触发 buildTrees）之前 */
 async function refreshTreeChops() {
   if (!S.island) return;
   const info = await api(`/api/islands/${S.island.id}/trees`);
-  S.treeChops = new Set((info.chopped || []).map(c => c[0] + ',' + c[1]));
+  const now = Date.now();
+  S.treeChops = new Map();
+  for (const c of (info.chopped || [])) {
+    if ((c[2] || 0) > now) S.treeChops.set(c[0] + ',' + c[1], c[2]);   // 只留未复育的
+  }
+  rebuildRegrowQueue();               // 重连 / 换岛：成长中的树苗从账里恢复
 }
 
 function applyPlots(list) {
@@ -5050,8 +5128,8 @@ async function refreshShips() {
 function applyPopulation(pop) {
   if (!S.island) return;
   S.population = pop || null;
-  // 建造列表的"置灰"也依赖人口（住宅要"先有港口"、工人住宅要"农夫够数"），所以一并重画
-  renderPopulation(); renderToolBar();
+  // 建造列表的"置灰"依赖人口（住宅要"先有港口"、工人住宅要"农夫够数"），所以重画工具条
+  renderToolBar();
   // 住宅头顶的幸福度状态牌跟着人口快照走（满足度跌破 60% 举牌）
   (S.buildings || []).forEach(v => {
     const n = bldNodes.find(b => b.view.id === v.id);
@@ -6151,7 +6229,16 @@ window.__annoTreePositions = () => {
   return out;
 };
 /* 验证脚本用：客户端树账（已砍格子的 key 集合）+ 索引一致性 */
-window.__annoTreeChops = () => [...(S.treeChops || [])];
+window.__annoTreeChops = () => [...(S.treeChops?.keys?.() || [])];
+window.__annoRegrowQueue = () => [...regrowQueue.values()].map(e =>
+  ({ x: e.x, z: e.z, k: +regrowK(e).toFixed(3), endMs: e.endMs }));
+window.__annoFauna = () => ({
+  sheep: sheep.length, deer: deer.length, bears: bears.length,
+  gulls: gulls.length, fishes: fishes.length,
+  labels: [...sheep, ...deer, ...bears].map(a => a.label),
+});
+window.__annoSelectCell = (x, z) => { S.selected = { kind: 'cell', x, z }; renderSel();
+  return document.getElementById('selBox').innerText; };   // 调试钩子：无头脚本验证选中面板文案
 window.__annoTreeIndex = () => ({ indexed: treeCellIndex.size, shown: trunkMesh ? trunkMesh.count : 0 });
 /* 测试钩子：当前路的格数 / 田数（批量建造验证用） */
 window.__annoBuildStats = () => ({
@@ -6227,14 +6314,22 @@ function updateRain(dt, W, up) {
    - 海鸥：3 群 × 4 只绕岛上空盘旋，两片三角翼上下扑；雷雨天归巢（隐藏）。
    - 跳鱼：几条鱼偶尔跃出海面划道抛物线，落水消失等下一次。
    - 羊：平原上散步吃草；脚下格子被建筑 / 农田 / 马路占了会自己挪窝。
+   - 鹿：3 只一群在林缘吃草踱步，警觉比羊高（挪得勤走得快）。
+   - 熊：1 头深林区独居慢游，站着张望，纯装饰不咬人。
+   羊 / 鹿 / 熊共用 tickGrazer 游荡状态机；点击空地会在选中面板报出
+   树木 / 树苗 / 身边的小动物（见 renderSel 的"地物"行）。
    ============================================================ */
 const GULL_MAT = new THREE.MeshStandardMaterial({ color:0xf5f7f8, roughness:1, flatShading:true });
 const WOOL_MAT = new THREE.MeshStandardMaterial({ color:0xefe9dc, roughness:1, flatShading:true });
 const FACE_MAT = new THREE.MeshStandardMaterial({ color:0x40382e, roughness:1, flatShading:true });
 const FISH_MAT = new THREE.MeshStandardMaterial({ color:0x5f93b8, roughness:0.8, flatShading:true });
+const DEER_MAT = new THREE.MeshStandardMaterial({ color:0x9a6b3f, roughness:1, flatShading:true });
+const DEER_TAIL_MAT = new THREE.MeshStandardMaterial({ color:0xf0e6d2, roughness:1, flatShading:true });
+const BEAR_MAT = new THREE.MeshStandardMaterial({ color:0x5c4128, roughness:1, flatShading:true });
+const ANTLER_MAT = new THREE.MeshStandardMaterial({ color:0xc9b18a, roughness:1, flatShading:true });
 
 let fauna = null;                          // 动物总 Group（换岛整体重建）
-const gulls = [], sheep = [], fishes = [];
+const gulls = [], sheep = [], fishes = [], deer = [], bears = [];
 
 /* 海鸥：锥身 + 两片三角翼（翼根为轴上下扑） */
 const _wingGeo = new THREE.BufferGeometry();
@@ -6273,6 +6368,52 @@ function makeSheep() {
   g.userData.hp = hp;
   return g;
 }
+/* 鹿：棕黄身子 + 细长腿 + 短颈抬头 + 一对角 + 白尾斑 */
+function makeDeer() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.IcosahedronGeometry(0.3, 0), DEER_MAT);
+  body.position.y = 0.62; body.scale.set(1.25, 0.95, 1); g.add(body);
+  const neck = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.3, 0.12), DEER_MAT);
+  neck.position.set(0, 0.84, 0.26); neck.rotation.x = -0.5; g.add(neck);
+  const hp = new THREE.Group(); hp.position.set(0, 1.0, 0.36); g.add(hp);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.14, 0.24), DEER_MAT);
+  head.position.z = 0.1; hp.add(head);
+  for (const s of [-1, 1]) {
+    const antler = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.2, 0.04), ANTLER_MAT);
+    antler.position.set(s * 0.09, 0.16, 0.02); antler.rotation.z = s * 0.45; hp.add(antler);
+    const ear = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.05, 0.06), DEER_MAT);
+    ear.position.set(s * 0.13, 0.07, 0); hp.add(ear);
+    for (const f of [-1, 1]) {
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.42, 0.055), DEER_MAT);
+      leg.position.set(s * 0.14, 0.21, f * 0.18); g.add(leg);
+    }
+  }
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.1, 0.05), DEER_TAIL_MAT);
+  tail.position.set(0, 0.68, -0.36); g.add(tail);
+  g.userData.hp = hp;
+  return g;
+}
+/* 熊：深棕大块头 + 圆耳 + 黑鼻吻 + 粗腿（体型是羊的一倍半，压得住场面） */
+function makeBear() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.IcosahedronGeometry(0.48, 0), BEAR_MAT);
+  body.position.y = 0.55; body.scale.set(1.15, 1, 1.35); g.add(body);
+  const hp = new THREE.Group(); hp.position.set(0, 0.82, 0.55); g.add(hp);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.26, 0.3), BEAR_MAT);
+  head.position.z = 0.12; hp.add(head);
+  const snout = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.12, 0.13), FACE_MAT);
+  snout.position.set(0, -0.05, 0.3); hp.add(snout);
+  for (const s of [-1, 1]) {
+    const ear = new THREE.Mesh(new THREE.IcosahedronGeometry(0.07, 0), BEAR_MAT);
+    ear.position.set(s * 0.14, 0.17, -0.02); hp.add(ear);
+    for (const f of [-1, 1]) {
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.3, 0.13), BEAR_MAT);
+      leg.position.set(s * 0.22, 0.15, f * 0.32); g.add(leg);
+    }
+  }
+  g.userData.hp = hp;
+  return g;
+}
 /* 鱼：外层 group 管 yaw（朝向），内层管 pitch（跃起 / 下落低头抬头） */
 function makeFish() {
   const g = new THREE.Group();
@@ -6303,10 +6444,28 @@ function randCoastWaterCell() {
   }
   return null;
 }
+/* 挑一格林区（长着树的平原）；edge=true 要求四邻至少一格无树平原（鹿在林缘吃草） */
+function randForestCell(edge) {
+  for (let i = 0; i < 120; i++) {
+    const x = Math.floor(Math.random() * GRID), z = Math.floor(Math.random() * GRID);
+    if (!treeCells.has(keyOf(x, z))) continue;
+    if (hasRoad(x, z) || bldCells.has(keyOf(x, z)) || plotCells.has(keyOf(x, z))) continue;
+    if (edge) {
+      const open = [[1,0],[-1,0],[0,1],[0,-1]].some(([dx, dz]) => {
+        const nx = x + dx, nz = z + dz;
+        return isPlainCell(nx, nz) && !treeCells.has(keyOf(nx, nz))
+          && !hasRoad(nx, nz) && !bldCells.has(keyOf(nx, nz)) && !plotCells.has(keyOf(nx, nz));
+      });
+      if (!open) continue;
+    }
+    return [x, z];
+  }
+  return null;
+}
 function initFauna() {
   if (fauna) scene.remove(fauna);
   fauna = new THREE.Group(); scene.add(fauna);
-  gulls.length = 0; sheep.length = 0; fishes.length = 0;
+  gulls.length = 0; sheep.length = 0; fishes.length = 0; deer.length = 0; bears.length = 0;
   /* 海鸥 3 群：群心随机挑块陆地，绕圈半径 9~17，两群顺时针一群逆 */
   for (let k = 0; k < 3; k++) {
     let cx = 0, cz = 0;
@@ -6335,7 +6494,41 @@ function initFauna() {
     g.position.set(wx, TOP_Y + cellH(cell[0], cell[1]) + 0.102, wz);
     g.rotation.y = Math.random() * Math.PI * 2;
     sheep.push({ g, x: cell[0], z: cell[1], mode: 'idle',
-      t: 2 + Math.random() * 6, ph: Math.random() * 7 });
+      t: 2 + Math.random() * 6, ph: Math.random() * 7, label: '🐑 羊' });
+  }
+  /* 鹿 3 只一小群：林缘吃草（进岛时森林还没生成就先落平原，
+     updateFauna 的 idle 拍发现树账到位会自己搬进林缘） */
+  {
+    const base = randForestCell(true);
+    for (let d = 0; d < 3; d++) {
+      let cell = null;
+      if (base) {
+        const off = [[0, 0], [1, 0], [0, 1]][d];
+        const nx = base[0] + off[0], nz = base[1] + off[1];
+        if (isPlainCell(nx, nz) && !hasRoad(nx, nz)
+            && !bldCells.has(keyOf(nx, nz)) && !plotCells.has(keyOf(nx, nz))) cell = [nx, nz];
+      }
+      if (!cell) cell = randPlainCell();
+      if (!cell) break;
+      const g = makeDeer(); fauna.add(g);
+      const [wx, wz] = cellToWorld(cell[0], cell[1]);
+      g.position.set(wx, TOP_Y + cellH(cell[0], cell[1]) + 0.102, wz);
+      g.rotation.y = Math.random() * Math.PI * 2;
+      deer.push({ g, x: cell[0], z: cell[1], mode: 'idle',
+        t: 1 + Math.random() * 4, ph: Math.random() * 7, label: '🦌 鹿' });
+    }
+  }
+  /* 熊 1 头：深林区独居慢游，纯装饰不咬人 */
+  {
+    const cell = randForestCell(false) || randPlainCell();
+    if (cell) {
+      const g = makeBear(); fauna.add(g);
+      const [wx, wz] = cellToWorld(cell[0], cell[1]);
+      g.position.set(wx, TOP_Y + cellH(cell[0], cell[1]) + 0.102, wz);
+      g.rotation.y = Math.random() * Math.PI * 2;
+      bears.push({ g, x: cell[0], z: cell[1], mode: 'idle',
+        t: 4 + Math.random() * 8, ph: Math.random() * 7, label: '🐻 熊' });
+    }
   }
   /* 跳鱼 4 条：初始各睡各的 */
   for (let f = 0; f < 4; f++) {
@@ -6343,6 +6536,63 @@ function initFauna() {
     fishes.push({ g, mode: 'wait', t: 4 + Math.random() * 10,
       u: 0, T: 1.15, h: 1.2, x0: 0, z0: 0, dx: 0, dz: 0 });
     g.visible = false;
+  }
+}
+/**
+ * 食草/游荡动物通用一拍（羊 / 鹿 / 熊共用，纯装饰不进服务端）：
+ * 闲着时啃草（graze）或站着张望（熊），到点挪去相邻空格；
+ * 脚下格子被建筑 / 农田 / 马路占了当场搬家。
+ * o.forest=true 的动物（鹿/熊）发现树账生成后还没进林子，idle 到点先搬回林区。
+ */
+function tickGrazer(a, dt, t, o) {
+  a.t -= dt;
+  const hereBusy = bldCells.has(keyOf(a.x, a.z)) || plotCells.has(keyOf(a.x, a.z)) || hasRoad(a.x, a.z);
+  if (hereBusy && a.mode !== 'walk') {                 // 脚下被占：立刻找新家
+    const nc = o.pickHome();
+    if (nc) { a.x = nc[0]; a.z = nc[1];
+      const [wx, wz] = cellToWorld(a.x, a.z);
+      a.g.position.set(wx, TOP_Y + cellH(a.x, a.z) + 0.102, wz); }
+    a.t = 3;
+  }
+  if (a.mode === 'idle') {
+    if (o.graze) a.g.userData.hp.rotation.x = 0.75 + Math.sin(t * 2 + a.ph) * 0.18;   // 啃草
+    else a.g.userData.hp.rotation.y = Math.sin(t * 0.6 + a.ph) * 0.5;                 // 张望
+    if (a.t <= 0) {
+      /* 该进林子还没进（鹿/熊开局落在平原、森林是后生成的）：先搬家再溜达 */
+      if (o.forest && treeCells.size && !treeCells.has(keyOf(a.x, a.z))) {
+        const fc = o.pickHome();
+        if (fc) {
+          a.x = fc[0]; a.z = fc[1];
+          const [wx, wz] = cellToWorld(a.x, a.z);
+          a.g.position.set(wx, TOP_Y + cellH(a.x, a.z) + 0.102, wz);
+          a.g.rotation.y = Math.random() * Math.PI * 2;
+          a.t = 2 + Math.random() * 4;
+          return;
+        }
+      }
+      const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+      const d = dirs[Math.floor(Math.random() * dirs.length)];
+      const nx = a.x + d[0], nz = a.z + d[1];
+      if (isPlainCell(nx, nz) && !hasRoad(nx, nz) && !bldCells.has(keyOf(nx, nz))
+          && !plotCells.has(keyOf(nx, nz))) {
+        const [wx, wz] = cellToWorld(nx, nz);
+        a.ox = a.g.position.x; a.oz = a.g.position.z;
+        a.tx = wx; a.tz = wz; a.nx = nx; a.nz = nz;
+        a.mode = 'walk'; a.u = 0; a.T = o.walkT[0] + Math.random() * (o.walkT[1] - o.walkT[0]);
+        a.g.rotation.y = Math.atan2(wx - a.ox, wz - a.oz);               // 朝向前进方向
+      } else a.t = 2;
+    }
+  } else {                                             // walk：两格间匀速挪 + 轻微颠步；y 在两格台地高之间平滑过渡
+    a.u = Math.min(1, a.u + dt / a.T);
+    a.g.position.x = a.ox + (a.tx - a.ox) * a.u;
+    a.g.position.z = a.oz + (a.tz - a.oz) * a.u;
+    const h0 = TOP_Y + cellH(a.x, a.z), h1 = TOP_Y + cellH(a.nx, a.nz);
+    a.g.position.y = h0 + (h1 - h0) * a.u + Math.abs(Math.sin(t * (o.walkT[0] < 1.5 ? 12 : 8) + a.ph)) * 0.045;
+    a.g.userData.hp.rotation.x = 0.1;
+    if (a.u >= 1) {
+      a.x = a.nx; a.z = a.nz; a.mode = 'idle'; a.t = o.idleT[0] + Math.random() * (o.idleT[1] - o.idleT[0]);
+      a.g.position.y = TOP_Y + cellH(a.x, a.z) + 0.102;
+    }
   }
 }
 function updateFauna(dt, t, W) {
@@ -6361,44 +6611,15 @@ function updateFauna(dt, t, W) {
     b.g.userData.wl.rotation.z = flap;
     b.g.userData.wr.rotation.z = -flap;
   }
-  /* 羊：闲了低头啃两嘴，起身挪去相邻空格；格子被占（盖楼/修路/种地）当场搬家 */
-  for (const s of sheep) {
-    s.t -= dt;
-    const hereBusy = bldCells.has(keyOf(s.x, s.z)) || plotCells.has(keyOf(s.x, s.z));
-    if (hereBusy && s.mode !== 'walk') {                 // 脚下被占：立刻找新家
-      const nc = randPlainCell();
-      if (nc) { s.x = nc[0]; s.z = nc[1];
-        const [wx, wz] = cellToWorld(s.x, s.z); s.g.position.set(wx, TOP_Y + cellH(s.x, s.z) + 0.102, wz); }
-      s.t = 3;
-    }
-    if (s.mode === 'idle') {
-      s.g.userData.hp.rotation.x = 0.75 + Math.sin(t * 2 + s.ph) * 0.18;   // 啃草
-      if (s.t <= 0) {
-        const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
-        const d = dirs[Math.floor(Math.random() * dirs.length)];
-        const nx = s.x + d[0], nz = s.z + d[1];
-        if (isPlainCell(nx, nz) && !hasRoad(nx, nz) && !bldCells.has(keyOf(nx, nz))
-            && !plotCells.has(keyOf(nx, nz))) {
-          const [wx, wz] = cellToWorld(nx, nz);
-          s.ox = s.g.position.x; s.oz = s.g.position.z;
-          s.tx = wx; s.tz = wz; s.nx = nx; s.nz = nz;
-          s.mode = 'walk'; s.u = 0; s.T = 1.8 + Math.random() * 1.2;
-          s.g.rotation.y = Math.atan2(wx - s.ox, wz - s.oz);               // 朝向前进方向
-        } else s.t = 2;
-      }
-    } else {                                             // walk：两格间匀速挪 + 轻微颠步；y 在两格台地高之间平滑过渡
-      s.u = Math.min(1, s.u + dt / s.T);
-      s.g.position.x = s.ox + (s.tx - s.ox) * s.u;
-      s.g.position.z = s.oz + (s.tz - s.oz) * s.u;
-      const h0 = TOP_Y + cellH(s.x, s.z), h1 = TOP_Y + cellH(s.nx, s.nz);
-      s.g.position.y = h0 + (h1 - h0) * s.u + Math.abs(Math.sin(t * 9 + s.ph)) * 0.045;
-      s.g.userData.hp.rotation.x = 0.1;
-      if (s.u >= 1) {
-        s.x = s.nx; s.z = s.nz; s.mode = 'idle'; s.t = 3 + Math.random() * 7;
-        s.g.position.y = TOP_Y + cellH(s.x, s.z) + 0.102;
-      }
-    }
-  }
+  /* 羊 / 鹿 / 熊共用同一套游荡状态机，节奏和老家各不相同 */
+  for (const s of sheep) tickGrazer(s, dt, t, {
+    pickHome: randPlainCell, walkT: [1.8, 3.0], idleT: [3, 10], graze: true });
+  for (const d of deer) tickGrazer(d, dt, t, {
+    pickHome: () => randForestCell(true) || randPlainCell(),
+    walkT: [0.9, 1.4], idleT: [1.5, 5], graze: true, forest: true });   // 鹿警觉：挪得勤、走得快
+  for (const b of bears) tickGrazer(b, dt, t, {
+    pickHome: () => randForestCell(false) || randPlainCell(),
+    walkT: [2.8, 4.2], idleT: [6, 16], graze: false, forest: true });   // 熊：慢悠悠、站定张望
   /* 跳鱼：睡够了几秒 → 挑贴岸水格起跳 → 抛物线 → 落水隐身 */
   for (const f of fishes) {
     if (f.mode === 'wait') {
@@ -6649,6 +6870,7 @@ function loop() {
   });
   tickCarts();                    // 在途马车的位置插值
   tickChopFx();                   // 被砍倒的树：倾倒演出
+  tickRegrow();                   // 树苗补种：砍过的格子渐长回成树
   tickLumberCrew(dt);             // 伐木工：通勤 / 待机 / 砍树
 
   /* 选中圈不自旋：椭圆要一直对齐建筑的占地方向（自旋会让长轴转出去） */

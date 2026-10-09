@@ -6,8 +6,10 @@
  *   3. 不修路时反复触发重建（等快照循环），位置与数量完全不变
  */
 import puppeteer from 'file:///C:/Users/92112/.workbuddy/binaries/node/workspace/node_modules/puppeteer-core/lib/puppeteer/puppeteer-core.js';
+import { spawn } from 'child_process';
 
 const BASE = 'http://127.0.0.1:8080';
+const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const NAME = '树稳验证' + Date.now();
 let pass = 0, fail = 0;
 const check = (name, ok, detail = '') => {
@@ -16,6 +18,33 @@ const check = (name, ok, detail = '') => {
 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** Edge 154 起：桌面 Edge 已有实例在跑时，新进程会把活儿移交出去后立刻退出（exit 0），
+    puppeteer 把"启动进程退出"误判成启动失败。兜底：自管无头进程 + 调试端口连接。 */
+const DBG_PORT = 9223;
+async function launchBrowser() {
+  try {
+    return { browser: await puppeteer.launch({
+      executablePath: EDGE,
+      headless: 'new',
+      args: ['--headless=new', '--enable-unsafe-swiftshader', '--use-angle=swiftshader', '--no-sandbox', '--window-size=1280,800'],
+    }) };
+  } catch (e) {
+    const prof = `C:/Users/92112/AppData/Local/Temp/pptr-anno-${Date.now()}`;
+    const child = spawn(EDGE, ['--headless=new', '--enable-unsafe-swiftshader', '--use-angle=swiftshader',
+      '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+      `--user-data-dir=${prof}`, `--remote-debugging-port=${DBG_PORT}`, '--window-size=1280,800', 'about:blank'],
+      { stdio: 'ignore' });
+    for (let i = 0; i < 40; i++) {
+      await sleep(500);
+      try {
+        const res = await fetch(`http://127.0.0.1:${DBG_PORT}/json/version`);
+        if (res.ok) return { browser: await puppeteer.connect({ browserURL: `http://127.0.0.1:${DBG_PORT}` }), child };
+      } catch { /* 还没起好，继续等 */ }
+    }
+    throw new Error('Edge 无头实例 20s 内没起来');
+  }
+}
 
 const api = async (path, method, body) => {
   const r = await fetch(BASE + path, { method: method || 'GET', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
@@ -27,11 +56,7 @@ const api = async (path, method, body) => {
 const p = await api('/api/players/register', 'POST', { name: NAME });
 const isl = await api('/api/islands', 'POST', { playerId: p.id, name: '树稳岛', flat: true });
 
-const browser = await puppeteer.launch({
-  executablePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-  headless: 'new',
-  args: ['--headless=new', '--enable-unsafe-swiftshader', '--use-angle=swiftshader', '--no-sandbox', '--window-size=1280,800'],
-});
+const { browser, child } = await launchBrowser();
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
@@ -77,5 +102,6 @@ try {
   console.log(`\n结果：${pass} 过 / ${fail} 挂`);
   process.exit(fail ? 1 : 0);
 } finally {
-  await browser.close();
+  await browser.close().catch(() => {});
+  try { child && child.kill(); } catch { /* 进程可能已随 close 退出 */ }
 }

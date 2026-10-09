@@ -572,8 +572,8 @@ public class ProductionService {
                 return 0;
             }
 
-            // 【缺树】伐木场只砍伐半径内的树：林区砍光就硬停产（纪元1800 式 —— 森林是一次性资源）。
-            // 翻转那一拍广播一次 TREE_STARVED，恢复有树（拆了重盖 / 半径扩到新林区）再广播 TREE_OK。
+            // 【缺树】伐木场只砍伐半径内的树：砍光就暂时停产（树苗复育期满这格会重新算有树）。
+            // 翻转那一拍广播一次 TREE_STARVED，恢复有树（补种到期 / 拆了重盖 / 半径扩到新林区）再广播 TREE_OK。
             if (type == BuildingType.LUMBERJACK) {
                 int trees = treeService.availableTreeCount(b, props.getLumberChopRadius());
                 if (trees <= 0) {
@@ -640,8 +640,8 @@ public class ProductionService {
                 stalled = false;
                 cycles++;
                 // 【真砍树】伐木场每产 woodPerTree 木就要砍掉一棵树（欠账累积）：
-                // 树是地理资源不是商品，砍掉的那格从"现存树"里永久消失（记 tree_chop 表），
-                // 并广播给客户端把那棵树演倒下。这一行就是"不是凭空生成木头"的落点。
+                // 树是地理资源不是商品，砍掉的那格进入复育期（记 tree_chop 表 + regrowAt），
+                // 并广播给客户端把那棵树演倒下、树苗开始长。这一行就是"不是凭空生成木头"的落点。
                 if (type == BuildingType.LUMBERJACK) {
                     int since = woodSinceChop.merge(b.getId(), outQty, Integer::sum);
                     if (since >= props.getWoodPerTree()) {
@@ -654,6 +654,7 @@ public class ProductionService {
                             payload.put("buildingId", b.getId());
                             payload.put("x", chopped.x());
                             payload.put("z", chopped.z());
+                            payload.put("regrowAt", chopped.regrowAt());   // 客户端按它渲染树苗渐大，避免各自算时刻
                             hub.broadcast("event", Map.of("type", "TREE_CHOPPED",
                                     "serverTime", System.currentTimeMillis(), "payload", payload));
                         }
